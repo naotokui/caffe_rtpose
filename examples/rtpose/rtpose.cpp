@@ -53,7 +53,7 @@
 DEFINE_bool(fullscreen,             false,          "Run in fullscreen mode (press f during runtime to toggle)");
 DEFINE_int32(part_to_show,          0,              "Part to show from the start.");
 DEFINE_string(write_frames,         "",             "Write frames with format prefix%06d.jpg");
-DEFINE_bool(write_org_frames,       false,          "Set True if you want to write original frames without joints");
+DEFINE_bool(no_joints_overlay,       false,          "Set True if you want to write original frames without joints");
 DEFINE_bool(no_frame_drops,         false,          "Dont drop frames.");
 DEFINE_string(write_json,           "",             "Write joint data with json format as prefix%06d.json");
 DEFINE_bool(send_json,              false,              "Send joint data with json format in ZMQ");
@@ -1193,7 +1193,7 @@ void* processFrame(void *i) {
 
                 // TODO: is this the best way??
                 // render joints on each frame
-                if (!FLAGS_write_org_frames){
+                if (!FLAGS_no_joints_overlay){
                   cudaMemcpy(frame_batch[n].data_for_mat, net_copies[tid].canvas, DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3 * sizeof(float), cudaMemcpyDeviceToHost);
                 }
                 global.output_queue.push(frame_batch[n]);
@@ -1420,7 +1420,7 @@ void* displayFrame(void *i) { //single thread
             // last_time += get_wall_time()-a;
         }
 
-        if (!FLAGS_send_json){
+        if (FLAGS_send_json){
 
           double scale = 1.0/frame.scale;
           const int num_parts = net_copies.at(0).up_model_descriptor->get_number_parts();
@@ -1750,7 +1750,7 @@ int setGlobalParametersFromFlags() {
         }
     }
 
-    if (!FLAGS_send_json) {
+    if (FLAGS_send_json) {
       // create zeromq socket
       void *context = zmq_ctx_new ();
       void *responder = zmq_socket (context, ZMQ_PUB);
