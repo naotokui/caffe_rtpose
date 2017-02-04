@@ -53,9 +53,10 @@
 DEFINE_bool(fullscreen,             false,          "Run in fullscreen mode (press f during runtime to toggle)");
 DEFINE_int32(part_to_show,          0,              "Part to show from the start.");
 DEFINE_string(write_frames,         "",             "Write frames with format prefix%06d.jpg");
+DEFINE_bool(write_org_frames,       false,          "Set True if you want to write original frames without joints");
 DEFINE_bool(no_frame_drops,         false,          "Dont drop frames.");
 DEFINE_string(write_json,           "",             "Write joint data with json format as prefix%06d.json");
-DEFINE_string(send_json,           "",              "Send joint data with json format in ZMQ");
+DEFINE_bool(send_json,              false,              "Send joint data with json format in ZMQ");
 DEFINE_int32(camera,                0,              "The camera index for VideoCapture.");
 DEFINE_string(video,                "",             "Use a video file instead of the camera.");
 DEFINE_string(image_dir,            "",             "Process a directory of images.");
@@ -1190,8 +1191,11 @@ void* processFrame(void *i) {
                     frame_batch[n].joints[ij] = joints[ij];
                 }
 
-
-                cudaMemcpy(frame_batch[n].data_for_mat, net_copies[tid].canvas, DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+                // TODO: is this the best way??
+                // render joints on each frame
+                if (!FLAGS_write_org_frames){
+                  cudaMemcpy(frame_batch[n].data_for_mat, net_copies[tid].canvas, DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+                }
                 global.output_queue.push(frame_batch[n]);
             }
         }
@@ -1416,7 +1420,7 @@ void* displayFrame(void *i) { //single thread
             // last_time += get_wall_time()-a;
         }
 
-        if (!FLAGS_send_json.empty()){
+        if (!FLAGS_send_json){
 
           double scale = 1.0/frame.scale;
           const int num_parts = net_copies.at(0).up_model_descriptor->get_number_parts();
@@ -1445,10 +1449,6 @@ void* displayFrame(void *i) { //single thread
           fs.seekg(0, std::ios::end);
           int size = fs.tellg();
           zmq_send (global.responder, fs.str().c_str(), size, 0);
-          // void *context = zmq_ctx_new ();
-          // void *responder = zmq_socket (context, ZMQ_REP);
-          // int rc = zmq_bind (responder, "tcp://*:5555");
-          // assert (rc == 0);
         }
 
         counter++;
@@ -1750,14 +1750,17 @@ int setGlobalParametersFromFlags() {
         }
     }
 
-    if (!FLAGS_send_json.empty()) {
+    if (!FLAGS_send_json) {
       // create zeromq socket
       void *context = zmq_ctx_new ();
       void *responder = zmq_socket (context, ZMQ_PUB);
 
       int rc = zmq_bind (responder, "tcp://*:5555");
-      assert (rc == 0);
-      global.responder = responder;
+      if (rc == 0){
+        global.responder = responder;
+      } else {
+        LOG(ERROR) << "Failed to open ZMQ socket";
+      }
     }
 
 
