@@ -29,6 +29,9 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 
+#include <zmq.hpp>
+#include <assert.h>
+
 #include "caffe/cpm/frame.h"
 #include "caffe/cpm/layers/imresize_layer.hpp"
 #include "caffe/cpm/layers/nms_layer.hpp"
@@ -52,6 +55,7 @@ DEFINE_int32(part_to_show,          0,              "Part to show from the start
 DEFINE_string(write_frames,         "",             "Write frames with format prefix%06d.jpg");
 DEFINE_bool(no_frame_drops,         false,          "Dont drop frames.");
 DEFINE_string(write_json,           "",             "Write joint data with json format as prefix%06d.json");
+DEFINE_string(send_json,           "",              "Send joint data with json format in ZMQ");
 DEFINE_int32(camera,                0,              "The camera index for VideoCapture.");
 DEFINE_string(video,                "",             "Use a video file instead of the camera.");
 DEFINE_string(image_dir,            "",             "Process a directory of images.");
@@ -69,7 +73,6 @@ DEFINE_double(start_scale,          1,              "Initial scale. Must cv::Mat
 DEFINE_double(scale_gap,            0.3,            "Scale gap between scales. No effect unless num_scales>1");
 DEFINE_int32(num_scales,            1,              "Number of scales to average");
 DEFINE_bool(no_display,             false,          "Do not open a display window.");
-DEFINE_bool(no_text,                false,          "Do not write text on output images.");
 
 // Global parameters
 int DISPLAY_RESOLUTION_WIDTH;
@@ -108,6 +111,8 @@ struct Global {
     float connect_min_subset_score;
     float connect_inter_threshold;
     int connect_inter_min_above_threshold;
+
+    void *responder;
 
     struct UIState {
         UIState() :
@@ -1321,7 +1326,7 @@ void* displayFrame(void *i) { //single thread
         } else {
             snprintf(tmp_str, 256, "%4.2f s/gpu", FLAGS_num_gpu*1.0/FPS);
         }
-        if (!FLAGS_no_text) {
+        if (1) {
         cv::putText(wrap_frame, tmp_str, cv::Point(25,35),
             cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(255,150,150), 1);
 
@@ -1346,19 +1351,15 @@ void* displayFrame(void *i) { //single thread
                     snprintf(tmp_str, 256, "%10s", conn.c_str());
                 }
             }
-            if (!FLAGS_no_text) {
-              cv::putText(wrap_frame, tmp_str, cv::Point(DISPLAY_RESOLUTION_WIDTH-175+1, 55+1),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255,255,255), 1);
-            }
+            cv::putText(wrap_frame, tmp_str, cv::Point(DISPLAY_RESOLUTION_WIDTH-175+1, 55+1),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255,255,255), 1);
         }
         if (!FLAGS_video.empty() && FLAGS_write_frames.empty()) {
             snprintf(tmp_str, 256, "Frame %6d", global.uistate.current_frame);
             // cv::putText(wrap_frame, tmp_str, cv::Point(27,37),
             //     cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0,0,0), 2);
-            if (!FLAGS_no_text) {
-              cv::putText(wrap_frame, tmp_str, cv::Point(25,55),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(255,255,255), 1);
-            }
+            cv::putText(wrap_frame, tmp_str, cv::Point(25,55),
+                cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(255,255,255), 1);
         }
 
         if (!FLAGS_no_display) {
@@ -1415,6 +1416,40 @@ void* displayFrame(void *i) { //single thread
             // last_time += get_wall_time()-a;
         }
 
+        if (!FLAGS_send_json.empty()){
+
+          double scale = 1.0/frame.scale;
+          const int num_parts = net_copies.at(0).up_model_descriptor->get_number_parts();
+
+          std::stringstream  fs;
+          fs << "{\n";
+          fs << "\"version\":0.1,\n";
+          fs << "\"bodies\":[\n";
+          for (int ip=0;ip<frame.numPeople;ip++) {
+              fs << "{\n" << "\"joints\":" << "[";
+              for (int ij=0;ij<num_parts;ij++) {
+                  fs << scale*frame.joints[ip*num_parts*3 + ij*3+0] << ",";
+                  fs << scale*frame.joints[ip*num_parts*3 + ij*3+1] << ",";
+                  fs << frame.joints[ip*num_parts*3 + ij*3+2];
+                  if (ij<num_parts-1) fs << ",";
+              }
+              fs << "]\n";
+              fs << "}";
+              if (ip<frame.numPeople-1) {
+                  fs<<",\n";
+              }
+          }
+          fs << "]\n";
+          fs << "}\n";
+
+          fs.seekg(0, std::ios::end);
+          int size = fs.tellg();
+          zmq_send (global.responder, fs.str().c_str(), size, 0);
+          // void *context = zmq_ctx_new ();
+          // void *responder = zmq_socket (context, ZMQ_REP);
+          // int rc = zmq_bind (responder, "tcp://*:5555");
+          // assert (rc == 0);
+        }
 
         counter++;
 
@@ -1714,6 +1749,17 @@ int setGlobalParametersFromFlags() {
             return 1;
         }
     }
+
+    if (!FLAGS_send_json.empty()) {
+      // create zeromq socket
+      void *context = zmq_ctx_new ();
+      void *responder = zmq_socket (context, ZMQ_PUB);
+
+      int rc = zmq_bind (responder, "tcp://*:5555");
+      assert (rc == 0);
+      global.responder = responder;
+    }
+
 
     BATCH_SIZE = {FLAGS_num_scales};
     SCALE_GAP = {FLAGS_scale_gap};
