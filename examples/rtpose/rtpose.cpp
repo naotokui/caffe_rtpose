@@ -57,6 +57,7 @@ DEFINE_bool(no_joints_overlay,       false,          "Set True if you want to wr
 DEFINE_bool(no_frame_drops,         false,          "Dont drop frames.");
 DEFINE_string(write_json,           "",             "Write joint data with json format as prefix%06d.json");
 DEFINE_bool(send_json,              false,              "Send joint data with json format in ZMQ");
+DEFINE_bool(receive_zmq,            false,              "Receive Image data via ZMQ");
 DEFINE_int32(camera,                0,              "The camera index for VideoCapture.");
 DEFINE_string(video,                "",             "Use a video file instead of the camera.");
 DEFINE_string(image_dir,            "",             "Process a directory of images.");
@@ -113,7 +114,7 @@ struct Global {
     float connect_inter_threshold;
     int connect_inter_min_above_threshold;
 
-    void *responder;
+    void *publisher, *subscriber;
 
     struct UIState {
         UIState() :
@@ -396,12 +397,110 @@ void* getFrameFromDir(void *i) {
     return nullptr;
 }
 
+void* getFrameFromZMQ(void *i) {
+    int global_counter = 1;
+    int frame_counter = 0;
+    cv::Mat image_uchar;
+    cv::Mat image_uchar_orig;
+    cv::Mat image_uchar_prev;
+    while(1) {
+        if (global.quit_threads) break;
+        // If the queue is too long, wait for a bit
+        if (global.input_queue.size()>10) {
+            usleep(10*1000.0);
+            continue;
+        }
+
+        // Init zmq message
+        zmq_msg_t msg;
+        zmq_msg_init (&msg);
+
+        // receive
+        int rc = zmq_recvmsg (global.subscriber, &msg, 0); // blocks untill receiving
+        if (rc == -1) continue;
+
+        // get data from zmq message and convert it to cvimage
+        size_t size = zmq_msg_size(&msg);
+        uchar *buffer = (uchar *)zmq_msg_data(&msg);
+        cv::Mat rawData  =  cv::Mat( 1, size, CV_8UC1,  buffer);
+        image_uchar_orig  =  cv::imdecode( rawData, CV_LOAD_IMAGE_COLOR);
+        zmq_msg_close (&msg);
+
+        // Keep a count of how many frames we've seen in the video
+        frame_counter++;
+
+        // This should probably be protected.
+        global.uistate.current_frame = frame_counter-1;
+
+//        image_uchar_orig = cv::imread(filename.c_str(), CV_LOAD_IMAGE_COLOR);
+        double scale = 0;
+        if (image_uchar_orig.cols/(double)image_uchar_orig.rows>DISPLAY_RESOLUTION_WIDTH/(double)DISPLAY_RESOLUTION_HEIGHT) {
+            scale = DISPLAY_RESOLUTION_WIDTH/(double)image_uchar_orig.cols;
+        } else {
+            scale = DISPLAY_RESOLUTION_HEIGHT/(double)image_uchar_orig.rows;
+        }
+        cv::Mat M = cv::Mat::eye(2,3,CV_64F);
+        M.at<double>(0,0) = scale;
+        M.at<double>(1,1) = scale;
+        cv::warpAffine(image_uchar_orig, image_uchar, M,
+                             cv::Size(DISPLAY_RESOLUTION_WIDTH, DISPLAY_RESOLUTION_HEIGHT),
+                             CV_INTER_CUBIC,
+                             cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
+        // resize(image_uchar, image_uchar, cv::Size(new_width, new_height), 0, 0, CV_INTER_CUBIC);
+        image_uchar_prev = image_uchar;
+
+        if ( image_uchar.empty() ) continue;
+
+        Frame frame;
+        frame.ori_width = image_uchar_orig.cols;
+        frame.ori_height = image_uchar_orig.rows;
+
+        LOG(ERROR) << frame.ori_height << " " << frame.ori_width;
+
+        frame.index = global_counter++;
+        frame.video_frame_number = global.uistate.current_frame;
+        frame.data_for_wrap = new unsigned char [DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3]; //fill after process
+        frame.data_for_mat = new float [DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3];
+        process_and_pad_image(frame.data_for_mat, image_uchar, DISPLAY_RESOLUTION_WIDTH, DISPLAY_RESOLUTION_HEIGHT, 0);
+
+        frame.scale = scale;
+        //pad and transform to float
+        int offset = 3 * NET_RESOLUTION_HEIGHT * NET_RESOLUTION_WIDTH;
+        frame.data = new float [BATCH_SIZE * offset];
+        int target_width, target_height;
+        cv::Mat image_temp;
+        //LOG(ERROR) << "frame.index: " << frame.index;
+        for(int i=0; i < BATCH_SIZE; i++) {
+            float scale = START_SCALE - i*SCALE_GAP;
+            target_width = 16 * ceil(NET_RESOLUTION_WIDTH * scale /16);
+            target_height = 16 * ceil(NET_RESOLUTION_HEIGHT * scale /16);
+
+            CHECK_LE(target_width, NET_RESOLUTION_WIDTH);
+            CHECK_LE(target_height, NET_RESOLUTION_HEIGHT);
+
+            resize(image_uchar, image_temp, cv::Size(target_width, target_height), 0, 0, CV_INTER_AREA);
+            process_and_pad_image(frame.data + i * offset, image_temp, NET_RESOLUTION_WIDTH, NET_RESOLUTION_HEIGHT, 1);
+        }
+        frame.commit_time = get_wall_time();
+        frame.preprocessed_time = get_wall_time();
+
+        global.input_queue.push(frame);
+
+    }
+
+    return nullptr;
+}
+
 void* getFrameFromCam(void *i) {
     cv::VideoCapture cap;
     double target_frame_time = 0;
     double target_frame_rate = 0;
     if (!FLAGS_image_dir.empty()) {
         return getFrameFromDir(i);
+    }
+
+    if (FLAGS_receive_zmq) {
+        return getFrameFromZMQ(i);
     }
 
     if (FLAGS_video.empty()) {
@@ -1448,7 +1547,7 @@ void* displayFrame(void *i) { //single thread
 
           fs.seekg(0, std::ios::end);
           int size = fs.tellg();
-          zmq_send (global.responder, fs.str().c_str(), size, 0);
+          zmq_send (global.publisher, fs.str().c_str(), size, 0);
         }
 
         counter++;
@@ -1750,19 +1849,29 @@ int setGlobalParametersFromFlags() {
         }
     }
 
-    if (FLAGS_send_json) {
-      // create zeromq socket
-      void *context = zmq_ctx_new ();
-      void *responder = zmq_socket (context, ZMQ_PUB);
-
-      int rc = zmq_bind (responder, "tcp://*:5555");
+    if (FLAGS_receive_zmq) {
+      void *context = zmq_ctx_new();
+      void *subscriber = zmq_socket (context, ZMQ_SUB);
+      int rc = zmq_connect(subscriber, "tcp://10.0.1.3:5556");
       if (rc == 0){
-        global.responder = responder;
+        // IMPORTANT: subscribe to all messages
+        zmq_setsockopt (subscriber, ZMQ_SUBSCRIBE, "", 0);
+        global.subscriber = subscriber;
       } else {
-        LOG(ERROR) << "Failed to open ZMQ socket";
+        LOG(ERROR) << "Failed to open ZMQ subscriber socket: " << rc;
       }
     }
 
+    if (FLAGS_send_json) {
+      void *context = zmq_ctx_new ();
+      void *publisher = zmq_socket (context, ZMQ_PUB);
+      int rc = zmq_bind (publisher, "tcp://*:5555");
+      if (rc == 0){
+        global.publisher = publisher;
+      } else {
+        LOG(ERROR) << "Failed to open ZMQ publisher socket";
+      }
+    }
 
     BATCH_SIZE = {FLAGS_num_scales};
     SCALE_GAP = {FLAGS_scale_gap};
